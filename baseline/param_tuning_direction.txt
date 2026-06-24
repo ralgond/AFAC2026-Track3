@@ -1,0 +1,7 @@
+[din_deepfm_v2]
+n_layers 3 2~4，数据少用2
+repr_dim 128 64~256
+emb_dim 32 16~64
+mask_prob 0.2 0.15~0.3
+aux_weight 0.05 0.05~0.2（数据多可加大）
+label_smooth 0.0 0.05~0.1（数据多时开启）
