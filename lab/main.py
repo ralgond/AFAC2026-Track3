@@ -76,14 +76,31 @@ client = OpenAI(
 def modify_config(in_file_path, out_file_path, parameter, modification):
     from_value, to_value = modification.split('->')
     with open(out_file_path, "w+") as of:
-        for line in file(in_file_path):
-            if line.contains('='):
+        for line in open(in_file_path):
+            if '=' in line:
                 k,_,v = line.strip().split()
                 if k.strip() == parameter:
                     assert v.strip() == from_value, (v.strip(), from_value)
                     of.write("    "+k+" = "+to_value)
+                else:
+                    of.write(line)
             else:
                 of.write(line)
+
+def modify_config_redirect_submission(in_file_path, dir, out_file_path):
+    with open(out_file_path, "w+") as of:
+        for line in open(in_file_path):
+            if '=' in line:
+                # print(line.strip().split())
+                l = line.strip().split()
+                k = l[0]
+                if k.strip() == 'output_path':
+                    of.write("    " + k + " = " + F'''"{dir.split('/')[0]}/A2.csv"''')
+                else:
+                    of.write(line)
+            else:
+                of.write(line)
+            
 
 def find_trajectory(parent_id, history_trajectory):
     ht = json.loads(history_trajectory)
@@ -108,14 +125,20 @@ def get_next_action(history_trajectory):
         messages=[{'role': 'user', 'content': prompt}]
     )
     
-    print(completion.choices[0].message.content)
+    ret = json.loads(completion.choices[0].message.content)
+    return ret
 
 
 def run_experiment(parent_dir, dir, parameter=None, modification=None):
-    if parameter is not None:
-        modify_config(f"{parent_dir}/config.py", f"{dir}/config.py")
+    if parent_dir is None:
+        modify_config_redirect_submission("./code/config.py", dir, f"{dir}/config1.py")
     else:
-        shutil.copy("./code/config.py", f"{dir}/config.py")
+        modify_config_redirect_submission(f"{parent_dir}/config.py", dir, f"{dir}/config1.py")
+    
+    if parameter is not None:
+        modify_config(f"{dir}/config1.py", f"{dir}/config.py")
+    else:
+        shutil.copy(f"{dir}/config1.py", f"{dir}/config.py")
     shutil.copy("./code/din_deepfm_e2e_cl_agu.py", f"{dir}/model.py")
     result = subprocess.run(["python", f"{dir}/model.py"], capture_output=True, text=True)
     if result.returncode != 0:
@@ -130,27 +153,59 @@ def run_experiment(parent_dir, dir, parameter=None, modification=None):
 
     last_best_ndcg_at_10 = ''
     for line in result.stdout.split('\n'):
-        if line.contains("best") and line.conains('NDCG@10:'):
-            _,v = line.split('NDCG@10:')
-            last_best_ndcg_at_10 = v
-    return float(v)
-        
-    
+        if 'Final best NDCG@10: ' in line:
+            last_best_ndcg_at_10 = line.strip().split('NDCG@10:')[-1]
+    return float(last_best_ndcg_at_10)
 
 def run(dir, start_time):
     id = 0
-    history_trajectory = '''[]'''
+    next_action = None
+    history_trajectory_text = '''[]'''
     while time.time() - start_time < 3600 * 2 - 300:
         node_dir_path = f"{dir}/{id}"
         os.makedirs(node_dir_path, exist_ok=True)
         if id == 0:
             best_score = run_experiment(None, node_dir_path)
-            print(best_score)
-            history_trajectory = '''[]'''
-            os._exit(0)
-        
-    
+            print(best_score, "elapsed seconds:", time.time() - start_time)
+            node = {
+                'id': 0, 'parent_id': -1, 'is_leaf': True, 'parameter':"", 'modification':"", 'best_score': best_score
+            }
+            history_trajectory = json.loads(history_trajectory_text)
+            history_trajectory.append(node)
+            history_trajectory_text = json.dumps(history_trajectory)
 
+            with open(f"{dir}/history_trajectory.json", "w+") as of:
+                of.write(history_trajectory_text)
+
+            next_action = get_next_action(history_trajectory_text)
+            id = next_action['id']
+            print(next_action)
+        else:
+            id = next_action['id']
+            parent_id = next_action['parent_id']
+            node_dir_path = f"{dir}/{id}"
+            parent_node_dir_path = f"{dir}/{parent_id}"
+            best_score = run_experiment(parent_node_dir_path, node_dir_path, next_action['parameter'], next_action['modification'])
+            print(best_score)
+
+            node = {
+                'id': id, 'parent_id': parent_id, 'is_leaf': True, 'parameter':"", 'modification':"", 'best_score': best_score
+            }
+
+            history_trajectory = json.loads(history_trajectory_text)
+            history_trajectory.append(node)
+            history_trajectory.sort(key=lambda x: x['id'])
+            for node in history_trajectory:
+                if node['id'] == parent_id:
+                    node['is_leaf'] = False
+            history_trajectory_text = json.dumps(history_trajectory)
+
+            with open(f"{dir}/history_trajectory.json", "w+") as of:
+                of.write(history_trajectory_text)
+
+            next_action = get_next_action(history_trajectory_text)
+            print(next_action)
+        
 def main():
     start_time = time.time()
     # history_trajectory = '''[{"id":0, "parent_id":-1, "is_leaf":false, "parameter":"", "modification":"", "best_score":0.5650}, {"id":1, "parent_id":0, "is_leaf":false, "parameter":"cl_weight", "modification":"0.1->0.2", "best_score":0.5700},{"id":2, "parent_id":1, "is_leaf":true "parameter":"temp", "modification":"0.05->0.01", "best_score":0.5701}]'''

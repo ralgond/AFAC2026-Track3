@@ -21,5 +21,5 @@ class Config:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    cl_weight = 0.2  # 对比学习 Loss 的权重
-    temp = 0.02      # 温度系数
+    cl_weight = 0.2
+    temp = 0.02
