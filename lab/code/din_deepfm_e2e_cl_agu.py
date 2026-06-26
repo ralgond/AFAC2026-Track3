@@ -52,32 +52,32 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 # ══════════════════════════════════════════════════════════
 # 0. 配置
 # ══════════════════════════════════════════════════════════
-class Config:
-    train_path  = "../data/A2-Rec/train.csv"
-    test_path   = "../data/A2-Rec/test.csv"
-    user_path   = "../data/A2-Rec/user.csv"
-    item_path   = "../data/A2-Rec/item.csv"
-    output_path = "submission_e2e.csv"
+# class Config:
+#     train_path  = "../data/A2-Rec/train.csv"
+#     test_path   = "../data/A2-Rec/test.csv"
+#     user_path   = "../data/A2-Rec/user.csv"
+#     item_path   = "../data/A2-Rec/item.csv"
+#     output_path = "submission_e2e.csv"
 
-    max_seq_len = 50          # 历史序列截断长度
-    emb_dim     = 32          # 每个特征域的 embedding 维度
-    repr_dim    = 128         # user/item tower 输出维度
-    n_heads     = 4           # 用户侧 self-attention 头数
-    mlp_dims    = [256, 128]  # user/item tower MLP 各层宽度
-    dropout     = 0.2
+#     max_seq_len = 50          # 历史序列截断长度
+#     emb_dim     = 32          # 每个特征域的 embedding 维度
+#     repr_dim    = 128         # user/item tower 输出维度
+#     n_heads     = 4           # 用户侧 self-attention 头数
+#     mlp_dims    = [256, 128]  # user/item tower MLP 各层宽度
+#     dropout     = 0.2
 
-    epochs      = 50
-    batch_size  = 256
-    lr          = 1e-3
-    weight_decay= 1e-5
-    seed        = 42
-    topk        = 10
+#     epochs      = 50
+#     batch_size  = 256
+#     lr          = 1e-3
+#     weight_decay= 1e-5
+#     seed        = 42
+#     topk        = 10
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    cl_weight = 0.2  # 对比学习 Loss 的权重
-    temp = 0.02      # 温度系数
-
+#     cl_weight = 0.2  # 对比学习 Loss 的权重
+#     temp = 0.02      # 温度系数
+from config import Config
 
 cfg = Config()
 random.seed(cfg.seed)

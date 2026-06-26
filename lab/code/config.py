@@ -1,3 +1,5 @@
+import torch
+
 class Config:
     train_path  = "../data/A2-Rec/train.csv"
     test_path   = "../data/A2-Rec/test.csv"
