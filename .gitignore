@@ -220,3 +220,4 @@ __marimo__/
 data/
 *.csv
 exp_*/
+*.pt

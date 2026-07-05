@@ -447,6 +447,8 @@ class GlobalData:
         self.best_snapshot_valid_acc = -1.
         self.best_snapshot_l = []
 
+        self.best_snapshot_d = {}
+
     def y_valid_true(self):
         return self.data.y[self.valid_idx].cpu().numpy()
 
@@ -476,6 +478,31 @@ class GlobalData:
             print(f'[ENSEMBLE ACCURARY] {self.best_snapshot_valid_acc}')
             print("="*80)
 
+    def check_incr_best_snapshot_valid_acc2(self, model_name, snapshot):
+        if model_name not in self.best_snapshot_d:
+            self.best_snapshot_d[model_name] = ([], -1.)
+
+        best_snapshot_l, best_snapshot_valid_acc = self.best_snapshot_d[model_name]
+        
+        l = best_snapshot_l.copy() + [snapshot]
+
+        _l = []
+        for result_snapshot in l:
+            valid_pred = result_snapshot['valid_pred']
+            _l.append(valid_pred)
+        
+        valid_pred_matrix = np.stack(_l, axis=0)
+        valid_ensemble = majority_vote(valid_pred_matrix)
+        ensemble_acc = (valid_ensemble == gd.y_valid_true()).mean()
+
+        if ensemble_acc > best_snapshot_valid_acc:
+            best_snapshot_l.append(snapshot)
+            best_snapshot_valid_acc = ensemble_acc
+            print("\n\n"+"="*80)
+            print(f'[ENSEMBLE ACCURARY] {best_snapshot_valid_acc}')
+            print("="*80)
+            self.best_snapshot_d[model_name] = (best_snapshot_l, best_snapshot_valid_acc)
+
 gd = GlobalData()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -504,6 +531,7 @@ PROMPT='''
 - valid accuracy低于0.7的模型是重点修改对象。
 - 如果参数增大，best_score增大，则继续尝试增大参数；如果参数减小，best_score增大，则继续尝试减小参数。
 - 当模型为GraphSAGE时，不要调试aggr参数。
+- 参数不应该修改成为小于或等于0。
 
 ## 输出
 - 输出为调整后的参数，每次只修改一个参数，格式一定是合法的json格式，不能是Markdown格式(不能以```json开头)，不要输出思考过程，例子如{{"id":0, "pid":-1, p:"hidden_channels", v:"128->125"}}
@@ -568,7 +596,7 @@ class EditTree:
     def edit_config_spec(self, config_spec):
         ret = copy.deepcopy(config_spec)
         best_trajectory = self.get_best_trajectory()
-        print(best_trajectory)
+        # print(best_trajectory)
         for en in best_trajectory:
             if en.pid == -1:
                 continue
@@ -576,7 +604,7 @@ class EditTree:
                 # print(f"====> {f.name}")
                 if en.p == f.name:
                     old_value, new_value = en.v.split('->')
-                    print(f"====>setattr: {f.name}, {f.type(new_value)}")
+                    # print(f"====>setattr: {f.name}, {f.type(new_value)}")
                     setattr(ret, f.name, f.type(new_value))
         return ret
 
@@ -649,36 +677,37 @@ class Agent:
     def run(self):
         start_time = time.time()
 
-        # while time.time() - start_time < 300:
-        if self.edit_tree.size() == 0:
-            model = self._train_model(self.origin_config_spec)
+        while time.time() - start_time < 300:
+            if self.edit_tree.size() == 0:
+                model = self._train_model(self.origin_config_spec)
 
-            all_preds, valid_pred, test_pred, acc = self.d.get_valid_test_acc(model)
+                all_preds, valid_pred, test_pred, acc = self.d.get_valid_test_acc(model)
 
-            self.d.check_incr_best_snapshot_valid_acc({'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc})
+                self.d.check_incr_best_snapshot_valid_acc2(self.model_name, {'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc})
 
-            self.edit_tree.add_node(0, -1, '', '', acc)
+                self.edit_tree.add_node(0, -1, '', '', acc)
 
-            self.next_action = self.gen_next_action(self.origin_config_spec, acc, acc)
+                self.next_action = self.gen_next_action(self.origin_config_spec, acc, acc)
 
-            # print("[0] next_action:", next_action)
-        else:
-            print('\n\n'+"="*80+'\n')
-            new_node = self.edit_tree.add_node(self.next_action['id'], self.next_action['pid'], self.next_action['p'], self.next_action['v'], 100)
-            config_spec = self.edit_tree.edit_config_spec(self.origin_config_spec)
-            print(config_spec)
-            
-            model = self._train_model(config_spec)
+                # print("[0] next_action:", next_action)
+            else:
+                print('\n\n'+"="*80+'\n')
+                new_node = self.edit_tree.add_node(self.next_action['id'], self.next_action['pid'], self.next_action['p'], self.next_action['v'], 100)
+                config_spec = self.edit_tree.edit_config_spec(self.origin_config_spec)
+                print(config_spec)
+                
+                model = self._train_model(config_spec)
 
-            all_preds, valid_pred, test_pred, acc = self.d.get_valid_test_acc(model)
+                all_preds, valid_pred, test_pred, acc = self.d.get_valid_test_acc(model)
 
-            self.d.check_incr_best_snapshot_valid_acc({'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc})
+                self.d.check_incr_best_snapshot_valid_acc2(self.model_name, {'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc})
 
-            new_node.best_score = acc
+                new_node.best_score = acc
 
-            self.next_action = self.gen_next_action(config_spec, acc, self.edit_tree.get_best_score())
+                self.next_action = self.gen_next_action(config_spec, acc, self.edit_tree.get_best_score())
 
-            # print(f"[{id}] next_action:", next_action)
+                # print(f"[{id}] next_action:", next_action)
+                
 
 all_result_snapshot = []
 start_time = time.time()
@@ -694,9 +723,17 @@ while time.time() - start_time < 3600 - 500:
             agent.run()
         else:
             break
+
     
 # 对 test_idx 做多数投票融合，作为最终提交结果
-test_pred_matrix = np.stack([result_snapshot['test_pred'] for result_snapshot in gd.best_snapshot_l], axis=0)
+l = []
+for model_name, (result_snapshot_l, best_score) in gd.best_snapshot_d.items():
+    print(model_name, best_score)
+    for result_snapshot in result_snapshot_l:
+        l.append(result_snapshot['test_pred'])
+    
+# test_pred_matrix = np.stack([result_snapshot['test_pred'] for result_snapshot in gd.best_snapshot_l], axis=0)
+test_pred_matrix = np.stack(l, axis=0)
 test_ensemble = majority_vote(test_pred_matrix)
 
 out_df = pd.DataFrame({'test_idx': gd.test_idx, 'label': test_ensemble})
