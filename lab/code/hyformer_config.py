@@ -22,7 +22,7 @@ class Config:
     dropout       = 0.2
 
     # 训练
-    epochs        = 50
+    epochs        = 5
     batch_size    = 256
     lr            = 1e-3
     weight_decay  = 1e-5
@@ -35,3 +35,5 @@ class Config:
     topk          = 10
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    predict = False

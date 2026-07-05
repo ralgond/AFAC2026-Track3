@@ -699,7 +699,7 @@ def predict(model, loader, ift, device, topk, id2item):
         tk = logits.topk(topk, dim=-1).indices.cpu().tolist()
         for i, uid in enumerate(uids):
             items = [id2item[iid] for iid in tk[i] if iid in id2item]
-            rows.append({"uid": uid, "predicted_items": ",".join(items)})
+            rows.append({"uid": uid, "prediction": ",".join(items)})
     return rows
 
 

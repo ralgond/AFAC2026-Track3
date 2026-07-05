@@ -700,7 +700,7 @@ def predict(model, loader, ift, device, topk, id2item):
         tk = logits.topk(topk, dim=-1).indices.cpu().tolist()
         for i, uid in enumerate(uids):
             items = [id2item[iid] for iid in tk[i] if iid in id2item]
-            rows.append({"uid": uid, "predicted_items": ",".join(items)})
+            rows.append({"uid": uid, "prediction": ",".join(items)})
     return rows
 
 
@@ -760,10 +760,11 @@ def main():
         model.load_state_dict({k: v.to(cfg.device) for k,v in best_state.items()})
     print(f"\nFinal best NDCG@{cfg.topk}: {best_ndcg:.4f}")
 
-    rows = predict(model, te_ld, ift, cfg.device, cfg.topk, proc.id2item)
-    pd.DataFrame(rows).to_csv(cfg.output_path, index=False)
-    print(f"Saved → {cfg.output_path}")
-    print(pd.DataFrame(rows).head(3).to_string())
+    if cfg.predict:
+        rows = predict(model, te_ld, ift, cfg.device, cfg.topk, proc.id2item)
+        pd.DataFrame(rows).to_csv(cfg.output_path, index=False)
+        print(f"Saved → {cfg.output_path}")
+        print(pd.DataFrame(rows).head(3).to_string())
 
 if __name__ == "__main__":
     main()
