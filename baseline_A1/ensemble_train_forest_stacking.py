@@ -19,9 +19,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv, GINConv, SAGEConv, GATv2Conv, GPSConv, GENConv, DeepGCNLayer
+from torch_geometric.nn import GCNConv, GINConv, SAGEConv, GATv2Conv, GPSConv, GENConv, DeepGCNLayer, APPNP
 from scipy.sparse import csr_matrix
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_predict
+from sklearn.linear_model import LogisticRegression
 from collections import Counter
 from dataclasses import dataclass, asdict, fields
 import pandas as pd
@@ -31,6 +32,8 @@ from openai import OpenAI
 import copy
 import time
 import random
+import numpy as np
+from typing import List, Dict, Any
 
 client = OpenAI(
     api_key=os.getenv("DASHSCOPE_API_KEY"),
@@ -120,14 +123,6 @@ def split_train_valid(train_idx: np.ndarray, labels: torch.Tensor,
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. 各模型的配置类（dataclass）
 # ─────────────────────────────────────────────────────────────────────────────
-@dataclass
-class DeeperGCNConfig:
-    in_channels: int
-    out_channels: int
-    hidden_channels: int = 128
-    num_layers: int = 7        # DeeperGCN 的卖点就是能稳定堆很多层
-    dropout: float = 0.1
-    learn_t: bool = True       # GENConv 的 softmax 聚合温度是否可学习
 
 @dataclass
 class GraphGPSConfig:
@@ -189,50 +184,20 @@ class GATConfig:
     heads: int = 8
     attn_dropout: float = 0.3
 
+
+@dataclass
+class APPNPConfig:
+    in_channels: int
+    out_channels: int
+    hidden_channels: int = 64
+    K: int = 10                    # Personalized PageRank 传播的跳数
+    alpha: float = 0.1             # 重启概率，固定不学习（这是 APPNP 和 GPRGNN 的主要区别）
+    dropout: float = 0.5           # 特征 MLP 部分的 dropout
+    dprate: float = 0.5            # 传播前单独的 dropout
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. 五个模型定义（结构与各自原始脚本保持一致，初始化统一接收 cfg）
-# ─────────────────────────────────────────────────────────────────────────────
-class DeeperGCN(nn.Module):
-    """
-    DeeperGCN（Li et al., "DeeperGCN: All You Need to Train Deeper GCNs"）。
-    核心组件：
-      - GENConv：广义消息传递卷积，用可学习温度的 softmax 聚合替代普通 mean/sum，
-        对训练很深的网络更稳定；
-      - DeepGCNLayer(block='res+')：PreAct 残差 block
-        （norm -> act -> dropout -> conv -> 与输入残差相加），
-        这种结构让梯度能顺畅传到浅层，因此可以堆叠远比普通 GCN 更深的层数而不退化。
-    整图前向，不需要 mini-batch；写法参考 PyG 官方 DeeperGCN 示例。
-    """
-    def __init__(self, cfg: DeeperGCNConfig):
-        super().__init__()
-        self.cfg = cfg
-        hid = cfg.hidden_channels
- 
-        self.node_encoder = nn.Linear(cfg.in_channels, hid)
- 
-        self.layers = nn.ModuleList()
-        for i in range(1, cfg.num_layers + 1):
-            conv = GENConv(hid, hid, aggr='softmax', t=1.0, learn_t=cfg.learn_t,
-                            num_layers=2, norm='layer')
-            norm = nn.LayerNorm(hid, elementwise_affine=True)
-            act  = nn.ReLU(inplace=True)
-            layer = DeepGCNLayer(conv, norm, act, block='res+', dropout=cfg.dropout)
-            self.layers.append(layer)
- 
-        self.out_lin = nn.Linear(hid, cfg.out_channels)
- 
-    def forward(self, x, edge_index):
-        x = self.node_encoder(x)
- 
-        # 第一层单独处理（'res+' block 从第二层开始才做 norm->act->conv->残差）
-        x = self.layers[0].conv(x, edge_index)
-        for layer in self.layers[1:]:
-            x = layer(x, edge_index)
- 
-        x = self.layers[0].act(self.layers[0].norm(x))
-        x = F.dropout(x, p=self.cfg.dropout, training=self.training)
-        return self.out_lin(x)
-        
+# ─────────────────────────────────────────────────────────────────────────────        
 class GraphGPS(nn.Module):
     """
     GraphGPS（General, Powerful, Scalable Graph Transformer）精简版。
@@ -447,6 +412,36 @@ class GAT(nn.Module):
             x = F.dropout(x, p=self.dropout, training=self.training)
         return self.convs[-1](x, edge_index)
 
+
+class APPNPNet(nn.Module):
+    """
+    APPNP（Approximate Personalized Propagation of Neural Predictions）。
+    结构上和 GPRGNN 几乎一样：两层 MLP 做特征变换，再做 K 跳 PPR 传播；
+    唯一的区别是传播权重是**固定**的（由 alpha 解析式给出，不参与训练），
+    直接复用 PyG 内置的 APPNP 传播层。相比 GPRGNN 参数更少、更稳定，
+    但在异配图上的适应能力通常不如 GPRGNN。
+    """
+    def __init__(self, cfg: APPNPConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.lin1 = nn.Linear(cfg.in_channels, cfg.hidden_channels)
+        self.lin2 = nn.Linear(cfg.hidden_channels, cfg.out_channels)
+        self.prop = APPNP(K=cfg.K, alpha=cfg.alpha)
+ 
+        self.dropout = cfg.dropout
+        self.dprate = cfg.dprate
+ 
+    def forward(self, x, edge_index):
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = F.relu(self.lin1(x))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.lin2(x)
+ 
+        if self.dprate > 0.0:
+            x = F.dropout(x, p=self.dprate, training=self.training)
+        x = self.prop(x, edge_index)
+        return x
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. 通用训练函数（沿用各原始脚本里"记录 best_loss 权重 + early stopping"的逻辑）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -509,6 +504,16 @@ def predict_all_nodes(model, data):
     return model(data.x, data.edge_index).argmax(dim=1).cpu().numpy()
 
 
+@torch.no_grad()
+def predict_all_probs(model, data):
+    """
+    返回每个节点在各个类别上的 softmax 概率，shape: [num_nodes, num_classes]。
+    用于 stacking 时给 meta-learner 提供比硬标签更丰富的置信度信息。
+    """
+    logits = model(data.x, data.edge_index)
+    return F.softmax(logits, dim=1).cpu().numpy()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. 多数投票（逐节点，出现次数最多的类别 = 最终预测）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -536,13 +541,13 @@ class GlobalData:
         data = self.data.to(DEVICE)
     
         self.origin_config_specs = {
-            'DeeperGCN': DeeperGCNConfig(self.num_feats, self.num_classes, hidden_channels=128, num_layers=7, dropout=0.1, learn_t=True),
-            'GraphGPS': GraphGPSConfig(self.num_feats, self.num_classes, hidden_channels=64, num_layers=3, num_global_layers=1, heads=4, dropout=0.5, attn_dropout=0.5),
-            'GCN': GCNConfig(self.num_feats, self.num_classes, hidden_channels=128, num_layers=3, dropout=0.5),
-            'GIN': GINConfig(self.num_feats, self.num_classes, hidden_channels=128, num_layers=3, mlp_layers=2, dropout=0.5, train_eps=True),
-            'GraphSAGE': GraphSAGEConfig(self.num_feats, self.num_classes, hidden_channels=256, num_layers=3, dropout=0.5, aggr='mean'),
-            'GAT': GATConfig(self.num_feats, self.num_classes, hidden_channels=64, num_layers=3, heads=8, dropout=0.5, attn_dropout=0.3),
-            'ResidualGCN': ResidualGCNConfig(self.num_feats, self.num_classes, hidden_channels=16, num_layers=16, dropout=0.5),
+            # 'GraphGPS': GraphGPSConfig(self.num_feats, self.num_classes, hidden_channels=64, num_layers=3, num_global_layers=1, heads=4, dropout=0.5, attn_dropout=0.5),
+            'GCN': GCNConfig(self.num_feats, self.num_classes, hidden_channels=32, num_layers=3, dropout=0.5),
+            'GIN': GINConfig(self.num_feats, self.num_classes, hidden_channels=32, num_layers=3, mlp_layers=2, dropout=0.5, train_eps=True),
+            'GraphSAGE': GraphSAGEConfig(self.num_feats, self.num_classes, hidden_channels=32, num_layers=3, dropout=0.5, aggr='mean'),
+            'GAT': GATConfig(self.num_feats, self.num_classes, hidden_channels=32, num_layers=3, heads=8, dropout=0.5, attn_dropout=0.3),
+            'ResidualGCN': ResidualGCNConfig(self.num_feats, self.num_classes, hidden_channels=32, num_layers=16, dropout=0.5),
+            'APPNPNet': APPNPConfig(self.num_feats, self.num_classes, hidden_channels=32, K=10, alpha=0.1, dropout=0.5, dprate=0.5),
         }
 
         # 6.2 划分 train/valid（所有模型共用同一份划分）
@@ -573,7 +578,12 @@ class GlobalData:
         valid_pred = all_preds[self.valid_idx.cpu().numpy()]
         test_pred = all_preds[self.test_idx]
         acc = (valid_pred == self.y_valid_true()).mean()
-        return all_preds, valid_pred, test_pred, acc
+
+        all_probs = predict_all_probs(model, self.data)
+        valid_prob = all_probs[self.valid_idx.cpu().numpy()]
+        test_prob = all_probs[self.test_idx]
+
+        return all_preds, valid_pred, test_pred, acc, valid_prob, test_prob
 
     def check_incr_best_snapshot_valid_acc(self, snapshot):
         l = self.best_snapshot_l.copy() + [snapshot]
@@ -619,9 +629,13 @@ PROMPT='''
 使模型计算出来的best_score(best valid accuracy)尽可能地大，当前的最大best_score为{best_score}。
 
 ## 调参细节
-- valid accuracy低于0.7的模型是重点修改对象。
 - 如果参数增大，best_score增大，则继续尝试增大参数；如果参数减小，best_score增大，则继续尝试减小参数。
 - 当模型为GraphSAGE时，不要调试aggr参数。
+- 参数一定要大于0。
+- ResidualGCN可以堆叠很多层比如16、32、64。
+- num_layers和hidden_channels是重点调试参数。
+- hidden_channels不能超过512，且它应该是16的倍数。
+- dropout不得高于0.5。
 
 ## 输出
 - 输出为调整后的参数，每次只修改一个参数，格式一定是合法的json格式，不能是Markdown格式(不能以```json开头)，不要输出思考过程，例子如{{"id":0, "pid":-1, p:"hidden_channels", v:"128->125"}}
@@ -721,6 +735,8 @@ class Agent:
         self.model_name = model_name
         self.d = d
         self.next_action = None
+        self.best_snapshot = None
+        self.best_score = -1.
     #     self.result_snapshot = []
     #     self.result_snapshot_read_idx = -1
 
@@ -771,9 +787,16 @@ class Agent:
         if self.edit_tree.size() == 0:
             model = self._train_model(self.origin_config_spec)
 
-            all_preds, valid_pred, test_pred, acc = self.d.get_valid_test_acc(model)
+            all_preds, valid_pred, test_pred, acc, valid_prob, test_prob = self.d.get_valid_test_acc(model)
 
-            self.d.check_incr_best_snapshot_valid_acc({'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc})
+            snapshot = {
+                'all_preds': all_preds, 'valid_pred': valid_pred, 'test_pred': test_pred, 'acc': acc,
+                'valid_prob': valid_prob, 'test_prob': test_prob,
+            }
+            self.d.check_incr_best_snapshot_valid_acc(snapshot)
+            if acc > self.best_score:
+                self.best_score = acc
+                self.best_snapshot = snapshot
 
             self.edit_tree.add_node(0, -1, '', '', acc)
 
@@ -788,9 +811,16 @@ class Agent:
             
             model = self._train_model(config_spec)
 
-            all_preds, valid_pred, test_pred, acc = self.d.get_valid_test_acc(model)
+            all_preds, valid_pred, test_pred, acc, valid_prob, test_prob = self.d.get_valid_test_acc(model)
 
-            self.d.check_incr_best_snapshot_valid_acc({'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc})
+            snapshot = {
+                'all_preds': all_preds, 'valid_pred': valid_pred, 'test_pred': test_pred, 'acc': acc,
+                'valid_prob': valid_prob, 'test_prob': test_prob,
+            }
+            self.d.check_incr_best_snapshot_valid_acc(snapshot)
+            if acc > self.best_score:
+                self.best_score = acc
+                self.best_snapshot = snapshot
 
             new_node.best_score = acc
 
@@ -798,33 +828,253 @@ class Agent:
 
             # print(f"[{id}] next_action:", next_action)
 
-all_result_snapshot = []
+
+def borda_count_voting(
+    agent_l: List[Agent],
+    y_valid_true,
+) -> Dict[str, Any]:
+    """
+    Borda Count 风格的排序投票（适用于离散标签场景，rank averaging 的替代方案）。
+
+    核心思路：
+        1. 按每个模型在 valid 集上的 accuracy 排序，accuracy 越高的模型排名越靠前(rank 越大)
+        2. 每个模型的投票权重 = 其排名（1 到 n_models），而不是像 BMA 那样用连续权重
+        3. 对每个样本，按模型排名加权投票，选出得分最高的类别
+
+    Returns: 结构与之前保持一致
+        {
+            'model_ranks': Dict[int, int],       # 每个 agent 下标 -> 排名权重
+            'best_valid_acc': float,
+            'ensemble_valid_pred': np.ndarray,
+            'ensemble_test_pred': np.ndarray,
+            'history': List[float],
+        }
+    """
+    y_valid_true = np.asarray(y_valid_true)
+    n_valid = len(y_valid_true)
+
+    all_labels = [y_valid_true]
+    for agent in agent_l:
+        all_labels.append(np.asarray(agent.best_snapshot["valid_pred"]))
+        all_labels.append(np.asarray(agent.best_snapshot["test_pred"]))
+    classes = np.unique(np.concatenate(all_labels))
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    n_classes = len(classes)
+
+    def encode(arr):
+        return np.array([class_to_idx[v] for v in arr], dtype=np.int64)
+
+    y_valid_true_enc = encode(y_valid_true)
+    valid_preds_enc = [encode(a.best_snapshot["valid_pred"]) for a in agent_l]
+    test_preds_enc = [encode(a.best_snapshot["test_pred"]) for a in agent_l]
+    n_test = len(test_preds_enc[0])
+    n_models = len(agent_l)
+
+    # ---- 1. 计算每个模型的 valid accuracy ----
+    individual_accs = [(pred_enc == y_valid_true_enc).mean() for pred_enc in valid_preds_enc]
+
+    # ---- 2. 按 accuracy 排序，得到 rank 权重(accuracy 最高的模型 rank = n_models) ----
+    order = np.argsort(individual_accs)  # 升序：accuracy 最低的排最前
+    rank_weight = np.empty(n_models, dtype=np.int64)
+    rank_weight[order] = np.arange(1, n_models + 1)  # 1 ~ n_models
+
+    model_ranks: Dict[int, int] = {i: int(rank_weight[i]) for i in range(n_models)}
+
+    # ---- 3. 按 rank 权重加权投票 ----
+    def weighted_vote_predict(preds_enc_list, n_samples):
+        vote_scores = np.zeros((n_samples, n_classes), dtype=np.float64)
+        for idx, pred_enc in enumerate(preds_enc_list):
+            w = rank_weight[idx]
+            vote_scores[np.arange(n_samples), pred_enc] += w
+        return np.argmax(vote_scores, axis=1)
+
+    ensemble_valid_pred_enc = weighted_vote_predict(valid_preds_enc, n_valid)
+    ensemble_test_pred_enc = weighted_vote_predict(test_preds_enc, n_test)
+
+    best_valid_acc = (ensemble_valid_pred_enc == y_valid_true_enc).mean()
+
+    idx_to_class = {i: c for c, i in class_to_idx.items()}
+    ensemble_valid_pred = np.array([idx_to_class[i] for i in ensemble_valid_pred_enc])
+    ensemble_test_pred = np.array([idx_to_class[i] for i in ensemble_test_pred_enc])
+
+    return {
+        "model_ranks": model_ranks,
+        "best_valid_acc": float(best_valid_acc),
+        "ensemble_valid_pred": ensemble_valid_pred,
+        "ensemble_test_pred": ensemble_test_pred,
+        "history": individual_accs,
+    }
+
+
+def stacking_ensemble(
+    agent_l: List[Agent],
+    y_valid_true,
+    n_splits: int = 5,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Stacking 融合（二级 meta-learner，基于概率特征）。
+
+    思路：
+        1. 每个 agent 当前手头最好的模型（agent.best_snapshot）在 valid / test 上
+           各自给出一个 softmax 概率分布（valid_prob / test_prob，
+           shape: [n_samples, n_classes]）；
+        2. 把所有模型的概率分布横向拼接，作为二级 meta 特征
+           （shape: [n_samples, n_models * n_classes]）。相比只用 argmax 硬标签，
+           概率保留了模型的置信度信息（例如"70% 把握 vs 34% 把握选了同一类"），
+           理论上能让 meta-learner 学到更精细的加权融合方式；
+        3. 用逻辑回归作为 meta-learner。为了不让 meta-learner 在它训练过的那份
+           valid 数据上"自证"（导致过于乐观的 valid accuracy），用 StratifiedKFold
+           交叉验证得到 out-of-fold 预测，以此计算更可信的 meta_valid_acc；
+        4. 最终用全部 valid 数据重新拟合一次 meta-learner，再对 test 做预测，
+           作为 stacking 最终的融合结果。
+
+    注意：
+        - 这里假设所有模型的概率输出都对应同一套类别顺序（即 label 本身就是
+          0..num_classes-1 的类别下标，与 GlobalData 里训练时用的 cross_entropy
+          标签一致），所以不需要再对类别做重新编码，可以直接把 valid_prob /
+          test_prob 拼接使用。
+
+    Returns:
+        {
+            'meta_valid_acc': float,               # out-of-fold valid accuracy
+            'ensemble_valid_pred': np.ndarray,      # out-of-fold 预测（可信度更高）
+            'ensemble_test_pred': np.ndarray,       # 用全部 valid 拟合后对 test 的预测
+            'individual_accs': List[float],         # 各 base model 的 valid accuracy
+        }
+    """
+    y_valid_true = np.asarray(y_valid_true)
+
+    valid_probs = [np.asarray(a.best_snapshot["valid_prob"]) for a in agent_l]
+    test_probs = [np.asarray(a.best_snapshot["test_prob"]) for a in agent_l]
+
+    individual_accs = [
+        (vp.argmax(axis=1) == y_valid_true).mean() for vp in valid_probs
+    ]
+
+    # ---- 1. 拼接 meta 特征（各 base model 的 softmax 概率）----
+    X_valid = np.concatenate(valid_probs, axis=1)
+    X_test = np.concatenate(test_probs, axis=1)
+
+    # ---- 2. 交叉验证得到更可信的 meta_valid_acc（避免同一份 valid 既训练又评估）----
+    min_class_count = int(np.min(np.bincount(y_valid_true)))
+    n_splits_eff = max(2, min(n_splits, min_class_count))
+
+    meta_clf_cv = LogisticRegression(max_iter=2000)
+    try:
+        skf = StratifiedKFold(n_splits=n_splits_eff, shuffle=True, random_state=seed)
+        ensemble_valid_pred = cross_val_predict(
+            meta_clf_cv, X_valid, y_valid_true, cv=skf
+        )
+    except ValueError:
+        # 某些类别样本数太少，无法做分层 K 折，退化为直接在 valid 上拟合+预测
+        meta_clf_cv.fit(X_valid, y_valid_true)
+        ensemble_valid_pred = meta_clf_cv.predict(X_valid)
+
+    meta_valid_acc = float((ensemble_valid_pred == y_valid_true).mean())
+
+    # ---- 3. 用全部 valid 数据重新拟合一次，作为最终 meta-learner 去预测 test ----
+    meta_clf = LogisticRegression(max_iter=2000)
+    meta_clf.fit(X_valid, y_valid_true)
+    ensemble_test_pred = meta_clf.predict(X_test)
+
+    return {
+        "meta_valid_acc": meta_valid_acc,
+        "ensemble_valid_pred": ensemble_valid_pred,
+        "ensemble_test_pred": ensemble_test_pred,
+        "individual_accs": individual_accs,
+    }
+
+
+best_BC = None
+best_stacking = None
+
 start_time = time.time()
 
 agent_l = []
 for model_name in gd.origin_config_specs.keys():
     agent = Agent(model_name, gd)
     agent_l.append(agent)
-        
-while time.time() - start_time < 3600 - 500:
-    for agent in agent_l:
-        if time.time() - start_time < 3600 - 500:
+
+try:
+    while time.time() - start_time < 7200 - 300:
+        for agent in agent_l:
             agent.run()
+
+        # ret = borda_count_voting(agent_l, gd.y_valid_true())
+        # print("="*80)
+        # print("bayesian_model_averaging.ret:", ret['best_valid_acc'])
+        # if best_BC is None:
+        #     best_BC = ret
+        #     print("best_BC.best_valid_acc:", best_BC['best_valid_acc'])
+        # elif best_BC['best_valid_acc'] < ret['best_valid_acc']:
+        #     best_BC = ret
+        #     print("best_BC.best_valid_acc:", best_BC['best_valid_acc'])
+        # print("="*80)
+
+        # ===== stacking logic =====
+        # 用每个 agent 当前最好的模型（agent.best_snapshot）做二级 stacking 融合，
+        # 与 gd.best_snapshot_l 的多数投票并行运行，最终选二者中 valid 表现更好的一个。
+        try:
+            stacking_ret = stacking_ensemble(agent_l, gd.y_valid_true())
+            print("\n" + "=" * 80)
+            print("stacking_ensemble.meta_valid_acc:", stacking_ret['meta_valid_acc'])
+            if best_stacking is None or stacking_ret['meta_valid_acc'] > best_stacking['meta_valid_acc']:
+                best_stacking = stacking_ret
+                print("best_stacking.meta_valid_acc:", best_stacking['meta_valid_acc'])
+            print("=" * 80)
+        except Exception as stacking_e:
+            # 某一轮 stacking 失败（例如某个 agent 还没有 best_snapshot）不应该
+            # 打断整个训练循环，跳过这一轮即可。
+            print(f"[stacking] skipped this round due to: {stacking_e}")
+except Exception as e:
+    print(e)
+finally:
+    # print("=====>BC:", best_BC['best_valid_acc'])
+    # print("=====>GES.history", best_BC['history'])
+    print("=====>VOTE:", gd.best_snapshot_valid_acc)
+    if best_stacking is not None:
+        print("=====>STACKING:", best_stacking['meta_valid_acc'])
+
+    # 对 test_idx 做多数投票融合，作为 baseline 提交结果
+    test_pred_matrix = np.stack([result_snapshot['test_pred'] for result_snapshot in gd.best_snapshot_l], axis=0)
+    test_ensemble = majority_vote(test_pred_matrix)
+
+    # test_ensemble = best_BC['ensemble_test_pred']
+
+    out_df = pd.DataFrame({'test_idx': gd.test_idx, 'label': test_ensemble})
+    out_df.to_csv('predictions_ensemble_forest.csv', index=False)
+
+    print(f"\n✓ Saved {len(out_df)} majority-vote ensemble predictions to predictions_ensemble_forest.csv")
+    print("\nFirst 10 rows:")
+    print(out_df.head(10).to_string(index=False))
+    print("\nPredicted class distribution:")
+    print(out_df['label'].value_counts().sort_index().to_string())
+
+    # 保存 stacking 融合结果，并与多数投票结果比较，挑更优的一个作为最终提交
+    if best_stacking is not None:
+        stack_df = pd.DataFrame({'test_idx': gd.test_idx, 'label': best_stacking['ensemble_test_pred']})
+        stack_df.to_csv('predictions_ensemble_stacking.csv', index=False)
+
+        print(f"\n✓ Saved {len(stack_df)} stacking ensemble predictions to predictions_ensemble_stacking.csv")
+        print("\nFirst 10 rows:")
+        print(stack_df.head(10).to_string(index=False))
+        print("\nPredicted class distribution:")
+        print(stack_df['label'].value_counts().sort_index().to_string())
+
+        if best_stacking['meta_valid_acc'] > gd.best_snapshot_valid_acc:
+            final_df = stack_df
+            print(f"\n✓ Stacking ({best_stacking['meta_valid_acc']:.4f}) > "
+                  f"Majority vote ({gd.best_snapshot_valid_acc:.4f}) on valid, "
+                  f"using stacking as final submission -> predictions_ensemble_final.csv")
         else:
-            break
-    
-# 对 test_idx 做多数投票融合，作为最终提交结果
-test_pred_matrix = np.stack([result_snapshot['test_pred'] for result_snapshot in gd.best_snapshot_l], axis=0)
-test_ensemble = majority_vote(test_pred_matrix)
-
-out_df = pd.DataFrame({'test_idx': gd.test_idx, 'label': test_ensemble})
-out_df.to_csv('predictions_ensemble_forest.csv', index=False)
-
-print(f"\n✓ Saved {len(out_df)} ensemble predictions to predictions_ensemble.csv")
-print("\nFirst 10 rows:")
-print(out_df.head(10).to_string(index=False))
-print("\nPredicted class distribution:")
-print(out_df['label'].value_counts().sort_index().to_string())
+            final_df = out_df
+            print(f"\n✓ Majority vote ({gd.best_snapshot_valid_acc:.4f}) >= "
+                  f"Stacking ({best_stacking['meta_valid_acc']:.4f}) on valid, "
+                  f"using majority vote as final submission -> predictions_ensemble_final.csv")
+        final_df.to_csv('predictions_ensemble_final.csv', index=False)
+    else:
+        out_df.to_csv('predictions_ensemble_final.csv', index=False)
                 
                 
             

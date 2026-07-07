@@ -31,6 +31,8 @@ from openai import OpenAI
 import copy
 import time
 import random
+import numpy as np
+from typing import List, Dict, Any
 
 client = OpenAI(
     api_key=os.getenv("DASHSCOPE_API_KEY"),
@@ -120,14 +122,6 @@ def split_train_valid(train_idx: np.ndarray, labels: torch.Tensor,
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. 各模型的配置类（dataclass）
 # ─────────────────────────────────────────────────────────────────────────────
-@dataclass
-class DeeperGCNConfig:
-    in_channels: int
-    out_channels: int
-    hidden_channels: int = 128
-    num_layers: int = 7        # DeeperGCN 的卖点就是能稳定堆很多层
-    dropout: float = 0.1
-    learn_t: bool = True       # GENConv 的 softmax 聚合温度是否可学习
 
 @dataclass
 class GraphGPSConfig:
@@ -191,48 +185,7 @@ class GATConfig:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. 五个模型定义（结构与各自原始脚本保持一致，初始化统一接收 cfg）
-# ─────────────────────────────────────────────────────────────────────────────
-class DeeperGCN(nn.Module):
-    """
-    DeeperGCN（Li et al., "DeeperGCN: All You Need to Train Deeper GCNs"）。
-    核心组件：
-      - GENConv：广义消息传递卷积，用可学习温度的 softmax 聚合替代普通 mean/sum，
-        对训练很深的网络更稳定；
-      - DeepGCNLayer(block='res+')：PreAct 残差 block
-        （norm -> act -> dropout -> conv -> 与输入残差相加），
-        这种结构让梯度能顺畅传到浅层，因此可以堆叠远比普通 GCN 更深的层数而不退化。
-    整图前向，不需要 mini-batch；写法参考 PyG 官方 DeeperGCN 示例。
-    """
-    def __init__(self, cfg: DeeperGCNConfig):
-        super().__init__()
-        self.cfg = cfg
-        hid = cfg.hidden_channels
- 
-        self.node_encoder = nn.Linear(cfg.in_channels, hid)
- 
-        self.layers = nn.ModuleList()
-        for i in range(1, cfg.num_layers + 1):
-            conv = GENConv(hid, hid, aggr='softmax', t=1.0, learn_t=cfg.learn_t,
-                            num_layers=2, norm='layer')
-            norm = nn.LayerNorm(hid, elementwise_affine=True)
-            act  = nn.ReLU(inplace=True)
-            layer = DeepGCNLayer(conv, norm, act, block='res+', dropout=cfg.dropout)
-            self.layers.append(layer)
- 
-        self.out_lin = nn.Linear(hid, cfg.out_channels)
- 
-    def forward(self, x, edge_index):
-        x = self.node_encoder(x)
- 
-        # 第一层单独处理（'res+' block 从第二层开始才做 norm->act->conv->残差）
-        x = self.layers[0].conv(x, edge_index)
-        for layer in self.layers[1:]:
-            x = layer(x, edge_index)
- 
-        x = self.layers[0].act(self.layers[0].norm(x))
-        x = F.dropout(x, p=self.cfg.dropout, training=self.training)
-        return self.out_lin(x)
-        
+# ─────────────────────────────────────────────────────────────────────────────        
 class GraphGPS(nn.Module):
     """
     GraphGPS（General, Powerful, Scalable Graph Transformer）精简版。
@@ -536,8 +489,7 @@ class GlobalData:
         data = self.data.to(DEVICE)
     
         self.origin_config_specs = {
-            'DeeperGCN': DeeperGCNConfig(self.num_feats, self.num_classes, hidden_channels=128, num_layers=7, dropout=0.1, learn_t=True),
-            'GraphGPS': GraphGPSConfig(self.num_feats, self.num_classes, hidden_channels=64, num_layers=3, num_global_layers=1, heads=4, dropout=0.5, attn_dropout=0.5),
+            # 'GraphGPS': GraphGPSConfig(self.num_feats, self.num_classes, hidden_channels=64, num_layers=3, num_global_layers=1, heads=4, dropout=0.5, attn_dropout=0.5),
             'GCN': GCNConfig(self.num_feats, self.num_classes, hidden_channels=128, num_layers=3, dropout=0.5),
             'GIN': GINConfig(self.num_feats, self.num_classes, hidden_channels=128, num_layers=3, mlp_layers=2, dropout=0.5, train_eps=True),
             'GraphSAGE': GraphSAGEConfig(self.num_feats, self.num_classes, hidden_channels=256, num_layers=3, dropout=0.5, aggr='mean'),
@@ -622,6 +574,11 @@ PROMPT='''
 - valid accuracy低于0.7的模型是重点修改对象。
 - 如果参数增大，best_score增大，则继续尝试增大参数；如果参数减小，best_score增大，则继续尝试减小参数。
 - 当模型为GraphSAGE时，不要调试aggr参数。
+- 参数一定要大于0。
+- ResidualGCN可以堆叠很多层比如16、32、64。
+- num_layers比hidden_channels更容易影响模型的输出精度。
+- hidden_channels不能超过512，且它应该是16的倍数。
+- dropout不得高于0.5。
 
 ## 输出
 - 输出为调整后的参数，每次只修改一个参数，格式一定是合法的json格式，不能是Markdown格式(不能以```json开头)，不要输出思考过程，例子如{{"id":0, "pid":-1, p:"hidden_channels", v:"128->125"}}
@@ -721,6 +678,8 @@ class Agent:
         self.model_name = model_name
         self.d = d
         self.next_action = None
+        self.best_snapshot = None
+        self.best_score = -1.
     #     self.result_snapshot = []
     #     self.result_snapshot_read_idx = -1
 
@@ -773,7 +732,11 @@ class Agent:
 
             all_preds, valid_pred, test_pred, acc = self.d.get_valid_test_acc(model)
 
-            self.d.check_incr_best_snapshot_valid_acc({'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc})
+            snapshot = {'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc}
+            # self.d.check_incr_best_snapshot_valid_acc(snapshot)
+            if acc > self.best_score:
+                self.best_score = acc
+                self.best_snapshot = snapshot
 
             self.edit_tree.add_node(0, -1, '', '', acc)
 
@@ -790,7 +753,11 @@ class Agent:
 
             all_preds, valid_pred, test_pred, acc = self.d.get_valid_test_acc(model)
 
-            self.d.check_incr_best_snapshot_valid_acc({'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc})
+            snapshot = {'all_preds':all_preds, 'valid_pred':valid_pred, 'test_pred':test_pred, 'acc':acc}
+            # self.d.check_incr_best_snapshot_valid_acc(snapshot)
+            if acc > self.best_score:
+                self.best_score = acc
+                self.best_snapshot = snapshot
 
             new_node.best_score = acc
 
@@ -798,33 +765,336 @@ class Agent:
 
             # print(f"[{id}] next_action:", next_action)
 
-all_result_snapshot = []
+
+
+# def greedy_ensemble_selection(
+#     agent_l: List["Agent"],
+#     y_valid_true: np.ndarray,
+#     max_size: int = 100,
+#     patience: int = 10,
+#     min_delta: float = 1e-6,
+# ) -> Dict[str, Any]:
+#     """
+#     Caruana-style greedy ensemble selection（有放回选择 + 探索式早停）。
+
+#     核心改动：每一轮都强制加入当轮最优候选（即使没有提升），
+#     从而允许算法"越过"局部平票/局部下降的陷阱去探索更大的组合；
+#     同时单独记录历史最优点，早停后回退（truncate）到历史最优状态，
+#     保证最终结果绝不差于任何中间步骤。
+#     """
+#     n_valid = len(y_valid_true)
+#     y_valid_true = np.asarray(y_valid_true)
+
+#     all_labels = [y_valid_true]
+#     for agent in agent_l:
+#         all_labels.append(np.asarray(agent.best_snapshot["valid_pred"]))
+#         all_labels.append(np.asarray(agent.best_snapshot["test_pred"]))
+#     classes = np.unique(np.concatenate(all_labels))
+#     class_to_idx = {c: i for i, c in enumerate(classes)}
+#     n_classes = len(classes)
+
+#     def encode(arr):
+#         return np.array([class_to_idx[v] for v in arr], dtype=np.int64)
+
+#     y_valid_true_enc = encode(y_valid_true)
+#     valid_preds_enc = [encode(a.best_snapshot["valid_pred"]) for a in agent_l]
+#     test_preds_enc = [encode(a.best_snapshot["test_pred"]) for a in agent_l]
+#     n_test = len(test_preds_enc[0])
+
+#     vote_counts_valid = np.zeros((n_valid, n_classes), dtype=np.int64)
+
+#     def vote_predict(vote_counts):
+#         return np.argmax(vote_counts, axis=1)
+
+#     def accuracy_from_counts(vote_counts, y_true_enc):
+#         return (vote_predict(vote_counts) == y_true_enc).mean()
+
+#     selected_indices: List[int] = []
+#     history: List[float] = []
+
+#     best_overall_acc = -np.inf
+#     best_overall_len = 0          # 历史最优时刻，ensemble 的长度
+#     best_overall_counts = vote_counts_valid.copy()
+#     no_improve_rounds = 0
+
+#     for step in range(max_size):
+#         best_step_acc = -np.inf
+#         best_step_idx = -1
+#         best_step_counts = None
+
+#         # 遍历所有候选，找本轮加入后能带来最高 accuracy 的那个（即使不如历史最优，也选本轮最好的）
+#         for idx, pred_enc in enumerate(valid_preds_enc):
+#             trial_counts = vote_counts_valid.copy()
+#             trial_counts[np.arange(n_valid), pred_enc] += 1
+#             acc = accuracy_from_counts(trial_counts, y_valid_true_enc)
+#             if acc > best_step_acc:
+#                 best_step_acc = acc
+#                 best_step_idx = idx
+#                 best_step_counts = trial_counts
+
+#         # 强制推进：无论是否提升，都接受本轮最优候选
+#         vote_counts_valid = best_step_counts
+#         selected_indices.append(best_step_idx)
+#         history.append(best_step_acc)
+
+#         # 更新历史最优记录
+#         if best_step_acc > best_overall_acc + min_delta:
+#             best_overall_acc = best_step_acc
+#             best_overall_len = len(selected_indices)
+#             best_overall_counts = vote_counts_valid.copy()
+#             no_improve_rounds = 0
+#         else:
+#             no_improve_rounds += 1
+#             if no_improve_rounds >= patience:
+#                 break
+
+#     # ---- 回退截断到历史最优点 ----
+#     selected_indices = selected_indices[:best_overall_len]
+#     vote_counts_valid = best_overall_counts
+
+#     weights: Dict[int, int] = {}
+#     for idx in selected_indices:
+#         weights[idx] = weights.get(idx, 0) + 1
+
+#     vote_counts_test = np.zeros((n_test, n_classes), dtype=np.int64)
+#     for idx, w in weights.items():
+#         vote_counts_test[np.arange(n_test), test_preds_enc[idx]] += w
+
+#     idx_to_class = {i: c for c, i in class_to_idx.items()}
+#     ensemble_valid_pred = np.array([idx_to_class[i] for i in vote_predict(vote_counts_valid)])
+#     ensemble_test_pred = np.array([idx_to_class[i] for i in vote_predict(vote_counts_test)])
+
+#     return {
+#         "selected_indices": selected_indices,
+#         "weights": weights,
+#         "best_valid_acc": best_overall_acc if selected_indices else 0.0,
+#         "ensemble_valid_pred": ensemble_valid_pred,
+#         "ensemble_test_pred": ensemble_test_pred,
+#         "history": history,   # 注意：这里是"探索过程"的 acc，不是回退后的最终 acc
+#     }
+
+
+
+def _single_greedy_run(
+    valid_preds_enc: List[np.ndarray],
+    y_valid_true_enc: np.ndarray,
+    n_classes: int,
+    sample_idx: np.ndarray,
+    max_size: int,
+    patience: int,
+    min_delta: float,
+) -> Dict[int, int]:
+    """
+    在给定的样本子集(sample_idx)上跑一次探索式贪心选择，返回 {agent_idx: 被选中次数}。
+    这是内部工具函数，不直接暴露给用户。
+    """
+    n_sub = len(sample_idx)
+    y_sub = y_valid_true_enc[sample_idx]
+    preds_sub = [p[sample_idx] for p in valid_preds_enc]
+
+    vote_counts = np.zeros((n_sub, n_classes), dtype=np.int64)
+
+    def vote_predict(vc):
+        return np.argmax(vc, axis=1)
+
+    def acc_from_counts(vc):
+        return (vote_predict(vc) == y_sub).mean()
+
+    selected_indices: List[int] = []
+    best_overall_acc = -np.inf
+    best_overall_len = 0
+    best_overall_counts = vote_counts.copy()
+    no_improve_rounds = 0
+
+    for _ in range(max_size):
+        best_step_acc = -np.inf
+        best_step_idx = -1
+        best_step_counts = None
+
+        for idx, pred_enc in enumerate(preds_sub):
+            trial = vote_counts.copy()
+            trial[np.arange(n_sub), pred_enc] += 1
+            acc = acc_from_counts(trial)
+            if acc > best_step_acc:
+                best_step_acc = acc
+                best_step_idx = idx
+                best_step_counts = trial
+
+        vote_counts = best_step_counts
+        selected_indices.append(best_step_idx)
+
+        if best_step_acc > best_overall_acc + min_delta:
+            best_overall_acc = best_step_acc
+            best_overall_len = len(selected_indices)
+            best_overall_counts = vote_counts.copy()
+            no_improve_rounds = 0
+        else:
+            no_improve_rounds += 1
+            if no_improve_rounds >= patience:
+                break
+
+    selected_indices = selected_indices[:best_overall_len]
+
+    weights: Dict[int, int] = {}
+    for idx in selected_indices:
+        weights[idx] = weights.get(idx, 0) + 1
+    return weights
+
+
+def greedy_ensemble_selection(
+    agent_l: List["Agent"],
+    y_valid_true,
+    max_size: int = 50,
+    patience: int = 5,
+    min_delta: float = 1e-6,
+    n_bags: int = 20,
+    bag_fraction: float = 1.0,
+    random_state: int = 42,
+) -> Dict[str, Any]:
+    """
+    Bagged Caruana-style greedy ensemble selection（接口与原版兼容，新增参数均有默认值）。
+
+    额外参数（可选，不传则使用默认值，等价于合理的 Bagging 配置）：
+        n_bags: bootstrap 重采样轮数，每轮独立跑一次贪心选择
+        bag_fraction: 每个 bag 的采样比例（相对完整 valid 集大小），默认 1.0 即与 Caruana 论文一致（有放回，等大小重采样）
+        random_state: 随机种子，保证可复现
+
+    Returns: 结构与原函数完全一致：
+        {
+            'selected_indices': ...,   # 展开后的模型下标列表（按权重展开，兼容旧字段含义）
+            'weights': Dict[int, int], # 所有 bag 累加后的模型权重
+            'best_valid_acc': float,   # 最终 ensemble 在完整 valid 集上的 accuracy
+            'ensemble_valid_pred': np.ndarray,
+            'ensemble_test_pred': np.ndarray,
+            'history': List[float],    # 每个 bag 跑完之后，累计 ensemble 在完整 valid 集上的 accuracy变化
+        }
+    """
+    rng = np.random.RandomState(random_state)
+
+    n_valid = len(y_valid_true)
+    y_valid_true = np.asarray(y_valid_true)
+
+    # ---- 统一类别编码 ----
+    all_labels = [y_valid_true]
+    for agent in agent_l:
+        all_labels.append(np.asarray(agent.best_snapshot["valid_pred"]))
+        all_labels.append(np.asarray(agent.best_snapshot["test_pred"]))
+    classes = np.unique(np.concatenate(all_labels))
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    n_classes = len(classes)
+
+    def encode(arr):
+        return np.array([class_to_idx[v] for v in arr], dtype=np.int64)
+
+    y_valid_true_enc = encode(y_valid_true)
+    valid_preds_enc = [encode(a.best_snapshot["valid_pred"]) for a in agent_l]
+    test_preds_enc = [encode(a.best_snapshot["test_pred"]) for a in agent_l]
+    n_test = len(test_preds_enc[0])
+
+    def vote_predict(vc):
+        return np.argmax(vc, axis=1)
+
+    def acc_on_full_valid(agg_weights: Dict[int, int]):
+        vc = np.zeros((n_valid, n_classes), dtype=np.int64)
+        for idx, w in agg_weights.items():
+            vc[np.arange(n_valid), valid_preds_enc[idx]] += w
+        return (vote_predict(vc) == y_valid_true_enc).mean(), vc
+
+    # ---- Bagging 主循环 ----
+    agg_weights: Dict[int, int] = {}
+    history: List[float] = []
+    n_sample = max(1, int(round(n_valid * bag_fraction)))
+
+    for bag_i in range(n_bags):
+        sample_idx = rng.choice(n_valid, size=n_sample, replace=True)
+
+        bag_weights = _single_greedy_run(
+            valid_preds_enc=valid_preds_enc,
+            y_valid_true_enc=y_valid_true_enc,
+            n_classes=n_classes,
+            sample_idx=sample_idx,
+            max_size=max_size,
+            patience=patience,
+            min_delta=min_delta,
+        )
+
+        for idx, w in bag_weights.items():
+            agg_weights[idx] = agg_weights.get(idx, 0) + w
+
+        # 记录累计到当前 bag 为止，在完整 valid 集上的 accuracy 变化趋势
+        cur_acc, _ = acc_on_full_valid(agg_weights) if agg_weights else (0.0, None)
+        history.append(cur_acc)
+
+    # ---- 用累加权重在完整 valid 集上算最终结果 ----
+    best_valid_acc, vote_counts_valid = acc_on_full_valid(agg_weights)
+
+    vote_counts_test = np.zeros((n_test, n_classes), dtype=np.int64)
+    for idx, w in agg_weights.items():
+        vote_counts_test[np.arange(n_test), test_preds_enc[idx]] += w
+
+    idx_to_class = {i: c for c, i in class_to_idx.items()}
+    ensemble_valid_pred = np.array([idx_to_class[i] for i in vote_predict(vote_counts_valid)])
+    ensemble_test_pred = np.array([idx_to_class[i] for i in vote_predict(vote_counts_test)])
+
+    # 兼容旧字段：把权重展开成下标列表
+    selected_indices: List[int] = []
+    for idx, w in agg_weights.items():
+        selected_indices.extend([idx] * w)
+
+    return {
+        "selected_indices": selected_indices,
+        "weights": agg_weights,
+        "best_valid_acc": best_valid_acc,
+        "ensemble_valid_pred": ensemble_valid_pred,
+        "ensemble_test_pred": ensemble_test_pred,
+        "history": history,
+    }
+
+best_GES = None
+
 start_time = time.time()
 
 agent_l = []
 for model_name in gd.origin_config_specs.keys():
     agent = Agent(model_name, gd)
     agent_l.append(agent)
-        
-while time.time() - start_time < 3600 - 500:
-    for agent in agent_l:
-        if time.time() - start_time < 3600 - 500:
+
+try:
+    while time.time() - start_time < 7200 - 300:
+        for agent in agent_l:
             agent.run()
-        else:
-            break
+            
+        ret = greedy_ensemble_selection(agent_l, gd.y_valid_true())
+        print("="*80)
+        print("greedy_ensemble_selection.ret:", ret['best_valid_acc'])
+        if best_GES is None:
+            best_GES = ret
+            print("best_GES.best_valid_acc:", best_GES['best_valid_acc'])
+        elif best_GES['best_valid_acc'] < ret['best_valid_acc']:
+            best_GES = ret
+            print("best_GES.best_valid_acc:", best_GES['best_valid_acc'])
+        print("="*80)
+except Exception as e:
+    print(e)
+finally: 
+    print("=====>GES:", best_GES['best_valid_acc'])
+    # print("=====>GES.history", best_GES['history'])
+    # print("=====>VOTE:", gd.best_snapshot_valid_acc)
     
-# 对 test_idx 做多数投票融合，作为最终提交结果
-test_pred_matrix = np.stack([result_snapshot['test_pred'] for result_snapshot in gd.best_snapshot_l], axis=0)
-test_ensemble = majority_vote(test_pred_matrix)
-
-out_df = pd.DataFrame({'test_idx': gd.test_idx, 'label': test_ensemble})
-out_df.to_csv('predictions_ensemble_forest.csv', index=False)
-
-print(f"\n✓ Saved {len(out_df)} ensemble predictions to predictions_ensemble.csv")
-print("\nFirst 10 rows:")
-print(out_df.head(10).to_string(index=False))
-print("\nPredicted class distribution:")
-print(out_df['label'].value_counts().sort_index().to_string())
+    # 对 test_idx 做多数投票融合，作为最终提交结果
+    # test_pred_matrix = np.stack([result_snapshot['test_pred'] for result_snapshot in gd.best_snapshot_l], axis=0)
+    # test_ensemble = majority_vote(test_pred_matrix)
+    
+    test_ensemble = best_GES['ensemble_test_pred']
+    
+    out_df = pd.DataFrame({'test_idx': gd.test_idx, 'label': test_ensemble})
+    out_df.to_csv('predictions_ensemble_forest.csv', index=False)
+    
+    print(f"\n✓ Saved {len(out_df)} ensemble predictions to predictions_ensemble.csv")
+    print("\nFirst 10 rows:")
+    print(out_df.head(10).to_string(index=False))
+    print("\nPredicted class distribution:")
+    print(out_df['label'].value_counts().sort_index().to_string())
                 
                 
             
